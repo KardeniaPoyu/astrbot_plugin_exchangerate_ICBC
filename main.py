@@ -829,6 +829,63 @@ class ICBCExchangeRatePlugin(Star):
         # 所有规则遍历完毕后统一保存一次
         if is_changed:
             await self.save_data()
+    
+    async def _check_drastic_change_and_push_chart(self, rates: list):
+        """检测汇率剧烈变化，自动推送走势图"""
+        alert_threshold = self.data.get("alert_threshold", 0.005)  # 默认0.5%变化触发
+        
+        # 获取所有追踪的币种
+        all_tracked = set()
+        for rules in self.data.get("monitors", {}).values():
+            for rule in rules:
+                all_tracked.add(rule["currency"])
+        if not all_tracked:
+            return
+        
+        chart_data = self.data.get("chart_data", {})
+        prev_rates = self.data.setdefault("_prev_rates", {})
+        
+        for currency in all_tracked:
+            target_rate = self._find_rate_by_currency(rates, currency)
+            if not target_rate:
+                continue
+            
+            # 取购汇价（用户实际关心的价格）
+            current = float(target_rate.get("foreignSell", 0))
+            if current <= 0:
+                continue
+            
+            prev = prev_rates.get(currency)
+            if prev is not None and prev > 0:
+                change = abs(current - prev) / prev
+                if change >= alert_threshold:
+                    # 剧烈变化！推送走势图
+                    records = chart_data.get(currency, [])
+                    if records:
+                        currency_name = target_rate.get("currencyCHName", currency)
+                        direction = "📈上涨" if current > prev else "📉下跌"
+                        pct = change * 100
+                        
+                        try:
+                            img_path = await asyncio.to_thread(
+                                ExchangeRateChartGenerator.generate, 
+                                currency, records[-60:]  # 近60条数据
+                            )
+                            if img_path:
+                                for session_id in self.data.get("monitors", {}):
+                                    await self.context.send_message(
+                                        session_id,
+                                        MessageChain([ 
+                                            Plain(f"⚠️ {currency_name}汇率{direction} {pct:.2f}% | 当前: {current}"),
+                                            Image.fromFileSystem(img_path)
+                                        ])
+                                    )
+                        except Exception as e:
+                            logger.error(f"剧烈变化推送走势图失败: {e}")
+            
+            prev_rates[currency] = current
+        
+        await self.save_data()
 
     async def monitor_loop(self):
         while True:
@@ -842,6 +899,8 @@ class ICBCExchangeRatePlugin(Star):
                     await self._update_price_extremes(rates)
                     # 检查阈值并推送通知
                     await self._check_and_notify_monitors(rates)
+                    # 检测剧烈变化并推送走势图
+                    await self._check_drastic_change_and_push_chart(rates)
 
                 # 无论 rates/monitors 是否为空，都必须执行休眠
                 cron_expr = self.data.get("cron", "*/30 * * * *")
